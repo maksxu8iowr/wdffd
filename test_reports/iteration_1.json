@@ -1,0 +1,22 @@
+{
+  "summary": "Tested all 5 requested FozPay changes (deposit amount fix, auto-convert-from-USDT, per-currency+network withdrawal fee matrix, explorer_url on tx, user balance_usdt) end-to-end via backend pytest (14/14 passing) and Playwright frontend flow. All backend endpoints returned expected shape (matrix has 16 rows, PUT persists BNB:4 override, checkout amount_to_pay==amount, auto-convert branch triggers only for EVM, admin users list carries balance_usdt, transactions include explorer_url key). Frontend Settings->Платформа renders full withdrawal fee matrix with data-testids pf-wd-row-BNB:4 / pf-wd-cab-BNB:4 / pf-wd-api-BNB:4 / pf-save; saving shows success toast 'Комісії платформи оновлено'. Користувачі tab renders 'Баланс: $0.00 (за курсом USDT)' via data-testid user-balance-{id}. Wallet page loads with transactions table.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_fozpay_new_features.py",
+    "/app/test_reports/pytest/fozpay_new.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is large; consider splitting withdraw() + withdrawal_worker() into a dedicated module for maintainability.",
+    "Standardized envelope {status, data} used consistently — good; ensure frontend axios interceptors unwrap 'data' uniformly (they appear to).",
+    "explorer_url is stored per transaction — good; make sure txid backfill after on-chain confirmation also rewrites explorer_url when previously null."
+  ],
+  "updated_files": ["/app/backend/tests/test_fozpay_new_features.py"],
+  "success_rate": {"backend": "100% (14/14)", "frontend": "100% (all requested UI elements verified)"},
+  "test_credentials": "admin@fozpay.io / FozPay#Admin2026",
+  "seed_data_creation": "Created a couple of TEST_ invoices via POST /api/invoices during testing; no cleanup needed (invoice-only, zero funds).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend API envelope is {status, data} — always unwrap .data. Admin login works. All balances are zero (real HD wallet), so on-chain deposit/withdrawal cannot be verified end-to-end in this env; only branching logic and DB records were validated. Withdraw auto-convert branch returns HTTP 400 with a Ukrainian detail mentioning USDT for EVM currencies and plain 'Недостатньо коштів' for BTC — this is intentional."
+}
