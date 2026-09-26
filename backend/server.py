@@ -186,6 +186,7 @@ def invoice_public(inv: dict) -> dict:
 async def send_webhook(merchant: dict, inv: dict, cur_iso=None, amount=0.0):
     url = merchant.get("result_url")
     if not url:
+        logger.info(f"webhook skip inv={inv.get('id')}: merchant has NO result_url configured")
         return
     rate = PRICES_USD.get(cur_iso, 0.0) if cur_iso else 0.0
     payload = {
@@ -197,15 +198,43 @@ async def send_webhook(merchant: dict, inv: dict, cur_iso=None, amount=0.0):
         "address": (inv.get("pay_info") or {}).get("address", ""),
         "network_type": (inv.get("pay_info") or {}).get("network", ""),
         "time_create": inv["time_create"], "time_update": now_ts(),
-        "time_done": now_ts() if inv["status"] in ("Paid", "Completed") else None,
+        "time_done": now_ts() if inv["status"] in ("Paid", "Completed", "Overpayment") else None,
         "time_expired": inv.get("time_expired"), "time_send": now_ts(),
         "time_receive": None, "include_commission": inv.get("include_commission", 0),
     }
+    # Sign the webhook exactly like the merchant API signs requests, so ewex-style
+    # receivers that verify X-Auth-Sign / X-Auth-Token accept the callback.
     try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(url, json=payload)
-    except Exception as e:
-        logger.info(f"webhook send failed: {e}")
+        sign = make_signature(payload, merchant.get("secret", ""))
+    except Exception:
+        sign = ""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Auth-Token": merchant.get("token", ""),
+        "X-Auth-Sign": sign,
+        "User-Agent": "FozPay-Webhook/1.0",
+    }
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                r = await c.post(url, json=payload, headers=headers)
+            logger.info(f"webhook sent inv={inv.get('id')} url={url} attempt={attempt} "
+                        f"status={r.status_code} resp={r.text[:200]}")
+            await db.invoices.update_one({"id": inv.get("id")}, {"$set": {
+                "webhook_status": r.status_code, "webhook_sent_ts": now_ts(),
+                "webhook_response": r.text[:500], "webhook_url": url}})
+            if 200 <= r.status_code < 300:
+                return
+            last_err = f"HTTP {r.status_code}: {r.text[:120]}"
+        except Exception as e:
+            last_err = str(e)
+            logger.info(f"webhook attempt {attempt} failed inv={inv.get('id')} url={url}: {e}")
+        await asyncio.sleep(2 * attempt)
+    await db.invoices.update_one({"id": inv.get("id")}, {"$set": {
+        "webhook_status": "failed", "webhook_error": str(last_err),
+        "webhook_sent_ts": now_ts(), "webhook_url": url}})
+    logger.warning(f"webhook FAILED after 3 attempts inv={inv.get('id')} url={url}: {last_err}")
 
 
 # ============================ auth router ============================
@@ -676,6 +705,37 @@ async def merchant_regen(request: Request):
     await db.merchants.update_one({"user_id": user["user_id"]},
                                   {"$set": {"token": new_token(), "secret": new_secret()}})
     return {"status": True, "data": await get_merchant(user["user_id"])}
+
+
+@cab.post("/merchant/test-webhook")
+async def merchant_test_webhook(request: Request):
+    """Send a signed sample webhook to the merchant result_url so integrators (ewex, etc.)
+    can verify delivery + signature immediately. Returns the HTTP status and response body."""
+    user = await get_current_user(request)
+    merchant = await get_merchant(user["user_id"])
+    url = merchant.get("result_url")
+    if not url:
+        raise HTTPException(400, "Спочатку вкажіть URL для сповіщень (result_url) у налаштуваннях мерчанта")
+    payload = {
+        "id": "test_" + gen_id(6), "order_id": "TEST-ORDER", "currency": "USDT",
+        "payment_currency": "USDT", "status": "Paid", "amount": 3.0, "amount_send": 3.0,
+        "price": 3.0, "price_send": 3.0, "rate": PRICES_USD.get("USDT", 1.0),
+        "total_sum_price": 3.0, "commission": 0, "address": "TEST", "network_type": "BEP-20",
+        "time_create": now_ts(), "time_update": now_ts(), "time_done": now_ts(),
+        "time_expired": None, "time_send": now_ts(), "time_receive": None,
+        "include_commission": 0, "test": True,
+    }
+    sign = make_signature(payload, merchant.get("secret", ""))
+    headers = {"Content-Type": "application/json", "X-Auth-Token": merchant.get("token", ""),
+               "X-Auth-Sign": sign, "User-Agent": "FozPay-Webhook/1.0"}
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+            r = await c.post(url, json=payload, headers=headers)
+        return {"status": True, "data": {"url": url, "http_status": r.status_code,
+                "response": r.text[:1000], "sign": sign,
+                "delivered": 200 <= r.status_code < 300}}
+    except Exception as e:
+        return {"status": False, "data": {"url": url, "error": str(e), "delivered": False}}
 
 
 # ---------- public checkout ----------
@@ -1232,7 +1292,7 @@ async def _credit_direct_deposit(a, iso, chain, nid, onchain):
             await add_to_pool(iso, fee_applied, network_id=nid)
         net_name = NETWORKS.get(nid, {}).get("name", chain)
         real_hash = await asyncio.to_thread(rec_mod.last_incoming_tx, address, chain, iso)
-        await add_transaction(
+        txrec = await add_transaction(
             a["user_id"], "deposit", iso, nid, net_amount, status="Done",
             address=address, txid=real_hash or "onchain",
             description=f"Deposit {iso} · {net_name} (gross {delta} {iso}, fee {fee_applied} {iso})",
@@ -1242,6 +1302,16 @@ async def _credit_direct_deposit(a, iso, chain, nid, onchain):
             {"$set": {"balance": onchain, "updated_ts": now_ts()}}, upsert=True)
         logger.info(f"direct deposit credited: {net_amount} {iso} on {chain} @ {address}")
         asyncio.create_task(sweep_to_hot_wallet(chain, iso, address))
+        # Notify merchant callback (result_url) for direct/API deposits too.
+        merchant = await db.merchants.find_one({"user_id": a["user_id"]}, {"_id": 0})
+        if merchant and merchant.get("result_url"):
+            synth = {
+                "id": txrec.get("tx_id"), "order_id": a.get("order_id", "") or "",
+                "status": "Paid", "payment_currency_iso": iso, "price": net_amount,
+                "pay_info": {"address": address, "network": net_name},
+                "time_create": now_ts(), "time_expired": None, "include_commission": 0,
+            }
+            asyncio.create_task(send_webhook(merchant, synth, iso, delta))
     elif onchain < last:
         await db.addr_credits.update_one(
             {"address": address, "iso": iso, "chain": chain},

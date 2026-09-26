@@ -44,6 +44,15 @@ export default function Settings() {
     try { const { data } = await api.post("/merchant/regenerate"); setM(data.data); toast.success(t("regenerate")); }
     catch (e) { toast.error(apiErr(e)); }
   };
+  const testWebhook = async () => {
+    if (!m.result_url) { toast.error("Спочатку вкажіть URL сповіщень та збережіть"); return; }
+    try {
+      const { data } = await api.post("/merchant/test-webhook");
+      const d = data.data || {};
+      if (d.delivered) toast.success(`Вебхук доставлено ✓ HTTP ${d.http_status}`);
+      else toast.error(`Не доставлено: ${d.error || ("HTTP " + d.http_status)}`);
+    } catch (e) { toast.error(apiErr(e)); }
+  };
   const copy = (v) => { navigator.clipboard.writeText(v); toast.success(t("copied")); };
 
   const setFee = (iso, key, val) => {
@@ -94,7 +103,13 @@ export default function Settings() {
                   <div className="mb-3 text-lg font-bold text-slate-900">{t("api_settings")}</div>
                   <div className="mb-2 text-xs text-slate-400">{t("api_key_note")}</div>
                   <div className="space-y-3">
-                    <div><Label>{t("result_url")}</Label><Input data-testid="merchant-result-url" value={m.result_url || ""} onChange={(e) => setM({ ...m, result_url: e.target.value })} className="rounded-xl mt-1" placeholder="https://site.com/webhook" /></div>
+                    <div><Label>{t("result_url")}</Label>
+                      <Input data-testid="merchant-result-url" value={m.result_url || ""} onChange={(e) => setM({ ...m, result_url: e.target.value })} className="rounded-xl mt-1" placeholder="https://site.com/webhook" />
+                      <div className="mt-2">
+                        <Button size="sm" variant="outline" data-testid="test-webhook-btn" onClick={testWebhook} className="rounded-full border-slate-300">Надіслати тестовий вебхук</Button>
+                        <p className="text-[11px] text-slate-400 mt-1">Надішле підписаний тестовий POST (X-Auth-Token + X-Auth-Sign) на цей URL, щоб перевірити прийом сповіщень.</p>
+                      </div>
+                    </div>
                     <div><Label>{t("token")}</Label>
                       <div className="mt-1 flex items-center gap-2 rounded-xl border border-slate-200 p-2">
                         <code data-testid="merchant-token" className="flex-1 truncate text-xs">{m.token}</code>
